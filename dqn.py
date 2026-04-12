@@ -40,7 +40,7 @@ class DQNAgent:
         lr: float = 1e-3,
         gamma: float = 0.99,
         epsilon_start: float = 1.0,
-        epsilon_end: float = 0.05,
+        epsilon_end: float = 0.02,
         epsilon_decay: int = 5000,
         batch_size: int = 256,
         buffer_size: int = 100_000,

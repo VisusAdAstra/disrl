@@ -2,14 +2,13 @@
 IQN: Implicit Quantile Network (PyTorch)
 
 Why IQN should outperform DQN on the bimodal environment:
-- The risky action has a BIMODAL return distribution (+20% / -10%).
-- DQN collapses this to a single mean (~+5.5%), barely above safe (+5%),
-  so it struggles to confidently prefer the risky action.
-- IQN models the FULL return distribution via sampled quantile levels tau~U(0,1).
-  It explicitly represents both the upside (+20%) and downside (-10%) as separate
-  quantile values, making risk-adjusted decisions possible.
-- As capital compounds, the variance of the risky action matters: IQN can
-  learn to always take risky (positive EV) without being confused by the noise.
+- Both actions have identical per-step EV (0.05) with flat reward.
+- The terminal bonus log(final_capital/100) favors safe compounding
+  (2.44 vs ~1.93), but this signal is diluted across 50 steps.
+- DQN only sees the mean total return → indifferent between actions.
+- IQN models the FULL return distribution and can detect that safe
+  trajectories have a concentrated, higher terminal bonus while risky
+  trajectories have a spread-out, lower one → prefers safe.
 
 Loss: normalised by N * N_target so scale is independent of quantile count.
 """
@@ -66,7 +65,7 @@ class IQNNetwork(nn.Module):
 
 class IQNAgent:
     def __init__(self, state_dim, n_actions, lr=1e-3, gamma=0.99,
-                 epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=5000,
+                 epsilon_start=1.0, epsilon_end=0.02, epsilon_decay=5000,
                  batch_size=256, buffer_size=100_000, target_update_freq=500,
                  n_quantiles=16, n_quantiles_target=16, n_quantiles_policy=64,
                  kappa=1.0, hidden=128, state_emb_dim=256, device="cuda", seed=0):

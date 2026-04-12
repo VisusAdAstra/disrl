@@ -1,0 +1,26 @@
+Corrected environment design: p_win=0.50, flat reward + terminal bonus
+
+Parameters:
+  safe:  +10% always
+  risky: +35% or -15% (50/50)
+  horizon: 100 steps
+
+Per-step EV:
+  safe  = 0.10
+  risky = 0.50*0.35 + 0.50*(-0.15) = 0.10  (identical)
+
+Terminal bonus = log(final_capital / 100):
+  safe:  log(1.10^100) = 9.53  (deterministic)
+  risky: 100 * 0.5*(log1.35 + log0.85) = 6.77  (noisy, lower mean)
+
+The gap is now 9.53 - 6.77 = 2.76 (much larger than before with 0.05/0.20/-0.10
+over 50 steps which was only 2.44 - 1.93 = 0.51). Bigger returns + longer
+horizon amplifies the compounding difference, making it easier for IQN to detect.
+
+Reference capitals:
+  Always safe:  100 * 1.10^100      = $1,378,061
+  Always risky: 100 * (1.35*0.85)^50 ≈ $87,025
+
+Expected behavior:
+  DQN:  ~50/50 safe/risky (indifferent on per-step, terminal signal diluted)
+  IQN:  prefers safe (models the full return distribution, sees safe is better)
