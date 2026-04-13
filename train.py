@@ -8,25 +8,20 @@ Usage: python train.py [options]
   --n_envs           INT    Parallel environments        (default: 8)
   --episode_length   INT    Steps per episode            (default: 50)
   --eval_interval    INT    Steps between evaluations    (default: 5000)
-  --eval_episodes    INT    Greedy eval episodes         (default: 30)
+  --eval_episodes    INT    Greedy eval episodes         (default: 50)
   --warmup_steps     INT    Steps before training starts (default: 2000)
   --lr               FLOAT  Learning rate                (default: 3e-4)
   --batch_size       INT    Batch size                   (default: 256)
   --gamma            FLOAT  Discount factor              (default: 0.99)
   --hidden           INT    Hidden layer width           (default: 128)
   --epsilon_frac     FLOAT  Fraction of total_steps for eps decay (default: 0.3)
-  --capital_ylim     FLOAT  Y-axis upper limit for capital plots  (default: 3000)
   --out_dir          STR    Output directory             (default: ./results)
 
 Reward design:
-  Flat per-step reward = raw return rate (0.10 safe, +0.35/-0.15 risky)
-  + terminal bonus = log(final_capital / 100)
-  Per-step EV is identical (0.10) → DQN indifferent.
+  Flat per-step reward = raw return rate (0.05 safe, +0.12/-0.50 risky)
+  + terminal bonus = log(final_capital / 100) / 100
+  Per-step EV is identical → DQN indifferent.
   Terminal bonus favors safe compounding → IQN can learn this.
-
-Theoretical optima (episode_length=100):
-  Always safe:  $100 * 1.10^100  = $1,378,061  (terminal bonus ~9.53)
-  Always risky (geometric): $100 * (1.35*0.85)^50 ≈ $87,025  (terminal bonus ~6.77)
 """
 
 import argparse, os, json, time, logging
@@ -35,6 +30,7 @@ import torch
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from scipy import stats
 from collections import deque
 
 from env import BimodalInvestmentEnv
@@ -42,8 +38,20 @@ from dqn import DQNAgent
 from iqn import IQNAgent
 
 PALETTE = {"DQN": "#E05C5C", "IQN": "#4A9EE0"}
-SAFE_CAPITAL   = 100 * 1.10**50             # $11,739 — always-safe baseline
-RISKY_CAPITAL  = 100 * (1.35 * 0.85)**25     # ~$3,178   — always-risky geometric mean
+
+# Env params (must match env.py)
+_SAFE_RET      = 0.05
+_RISKY_WIN     = 0.12
+_RISKY_LOSS    = -0.5
+_RISKY_P_WIN   = 0.9
+_EP_LEN        = 50
+
+# Always-safe: deterministic compounding
+SAFE_CAPITAL  = 100 * (1 + _SAFE_RET) ** _EP_LEN          # ~$1,147
+
+# Always-risky: geometric mean growth per step = (1+win)^p * (1+loss)^(1-p)
+_RISKY_GROWTH = (1 + _RISKY_WIN) ** _RISKY_P_WIN * (1 + _RISKY_LOSS) ** (1 - _RISKY_P_WIN)
+RISKY_CAPITAL = 100 * _RISKY_GROWTH ** _EP_LEN             # ~$239 (geometric mean)
 
 
 def parse_args():
@@ -60,7 +68,6 @@ def parse_args():
     p.add_argument("--gamma",          type=float, default=0.99)
     p.add_argument("--hidden",         type=int,   default=128)
     p.add_argument("--epsilon_frac",   type=float, default=0.35)
-    p.add_argument("--capital_ylim",   type=float, default=2_000_000.0)
     p.add_argument("--out_dir",        type=str,   default="./results")
     return p.parse_args()
 
@@ -80,23 +87,25 @@ def setup_logging(out_dir):
 
 def evaluate(agent, args, device):
     """
-    Greedy evaluation: manually step episodes (no env auto-reset side-effects).
-    Returns (mean_cumulative_pct_reward, mean_final_capital, mean_risky_fraction).
+    Greedy evaluation over eval_episodes full episodes.
+    Returns:
+      mean_reward       - mean cumulative reward across episodes
+      mean_capital      - mean final capital
+      mean_risky_frac   - mean fraction of risky steps
+      all_capitals      - list of per-episode final capitals (for distribution)
     """
-    ep_rewards   = []
-    ep_capitals  = []
+    ep_rewards    = []
+    ep_capitals   = []
     ep_risky_frac = []
 
     for _ in range(args.eval_episodes):
-        capital    = 100.0
-        ep_reward  = 0.0
+        capital     = 100.0
+        ep_reward   = 0.0
         risky_steps = 0
 
         for t in range(args.episode_length):
             step_frac = t / args.episode_length
-            state = torch.FloatTensor(
-                [[np.log(capital / 100.0), step_frac]]
-            ).to(device)
+            state = torch.FloatTensor([[np.log(capital / 100.0), step_frac]]).to(device)
 
             with torch.no_grad():
                 if hasattr(agent, "n_quantiles_policy"):
@@ -108,21 +117,26 @@ def evaluate(agent, args, device):
             if action == 0:
                 ret = 0.05
             else:
-                ret = 0.12 if np.random.random() < 0.50 else -0.5
+                ret = 0.12 if np.random.random() < 0.9 else -0.5
                 risky_steps += 1
 
-            ep_reward += ret                    # flat per-step reward
+            ep_reward += ret
             capital   *= (1 + ret)
 
-        ep_reward += np.log(capital / 100.0)    # terminal bonus
+        ep_reward += np.log(capital / 100.0) / 100
         ep_rewards.append(ep_reward)
         ep_capitals.append(capital)
         ep_risky_frac.append(risky_steps / args.episode_length)
 
-    return (float(np.mean(ep_rewards)),
-            float(np.mean(ep_capitals)),
-            float(np.mean(ep_risky_frac)))
+    return (
+        float(np.mean(ep_rewards)),
+        float(np.median(ep_capitals)),   # median: not skewed by lucky tail runs
+        float(np.mean(ep_risky_frac)),
+        ep_capitals,   # full distribution for box plots / histograms
+    )
 
+
+# ── Training loop ─────────────────────────────────────────────────────────────
 
 def train_run(agent_class, agent_kwargs, seed, label, args, device, log):
     log.info(f"Starting {label} seed={seed}")
@@ -132,11 +146,15 @@ def train_run(agent_class, agent_kwargs, seed, label, args, device, log):
     )
     state = env.reset()
 
-    eval_steps     = []
-    eval_rewards   = []
-    eval_capitals  = []
+    eval_steps      = []
+    eval_rewards    = []
+    eval_capitals   = []   # mean per checkpoint
     eval_risky_frac = []
-    recent_losses  = deque(maxlen=200)
+    # Store per-episode capitals only for last 20% of training (converged policy)
+    converged_capitals = []
+    converge_step = int(args.total_steps * 0.80)
+
+    recent_losses = deque(maxlen=200)
     step = 0
     t0   = time.time()
 
@@ -158,35 +176,62 @@ def train_run(agent_class, agent_kwargs, seed, label, args, device, log):
                 recent_losses.append(loss)
 
         if step % args.eval_interval < args.n_envs:
-            avg_rew, avg_cap, risky_frac = evaluate(agent, args, device)
+            avg_rew, avg_cap, risky_frac, ep_caps = evaluate(agent, args, device)
             eval_steps.append(step)
             eval_rewards.append(avg_rew)
             eval_capitals.append(avg_cap)
             eval_risky_frac.append(risky_frac)
+
+            # Collect full capital distribution once policy has converged
+            if step >= converge_step:
+                converged_capitals.extend(ep_caps)
+
             avg_loss = float(np.mean(recent_losses)) if recent_losses else float("nan")
             log.info(
                 f"[{label} s{seed}] step={step:7d} | "
-                f"capital=${avg_cap:8.2f} | risky={risky_frac:.2f} | "
+                f"median_cap=${avg_cap:8.2f} | risky={risky_frac:.2f} | "
                 f"loss={avg_loss:.5f} | eps={agent.epsilon:.3f} | "
                 f"elapsed={time.time()-t0:.0f}s"
             )
 
+    # Convergence classification: mean risky frac over last 20% of checkpoints
+    n_conv = max(1, len(eval_risky_frac) // 5)
+    conv_risky = float(np.mean(eval_risky_frac[-n_conv:]))
+    if conv_risky < 0.30:
+        conv_label = "safe"
+    elif conv_risky > 0.70:
+        conv_label = "risky"
+    else:
+        conv_label = "mixed"
+
     with open(os.path.join(args.out_dir, f"{label}_seed{seed}_log.json"), "w") as f:
-        json.dump({"eval_steps": eval_steps, "eval_rewards": eval_rewards,
-                   "eval_capitals": eval_capitals, "eval_risky_frac": eval_risky_frac}, f)
+        json.dump({
+            "eval_steps":          eval_steps,
+            "eval_rewards":        eval_rewards,
+            "eval_capitals":       eval_capitals,
+            "eval_risky_frac":     eval_risky_frac,
+            "converged_capitals":  converged_capitals,
+            "conv_risky":          conv_risky,
+            "conv_label":          conv_label,
+        }, f)
 
     return {
-        "label":          label,
-        "seed":           seed,
-        "eval_steps":     eval_steps,
-        "eval_rewards":   eval_rewards,
-        "eval_capitals":  eval_capitals,
-        "eval_risky_frac": eval_risky_frac,
-        "final_capital":  eval_capitals[-1]  if eval_capitals  else None,
-        "final_reward":   eval_rewards[-1]   if eval_rewards   else None,
-        "final_risky":    eval_risky_frac[-1] if eval_risky_frac else None,
+        "label":               label,
+        "seed":                seed,
+        "eval_steps":          eval_steps,
+        "eval_rewards":        eval_rewards,
+        "eval_capitals":       eval_capitals,
+        "eval_risky_frac":     eval_risky_frac,
+        "converged_capitals":  converged_capitals,   # distribution for box/histogram
+        "final_capital":       eval_capitals[-1]  if eval_capitals  else None,
+        "final_reward":        eval_rewards[-1]   if eval_rewards   else None,
+        "final_risky":         eval_risky_frac[-1] if eval_risky_frac else None,
+        "conv_risky":          conv_risky,
+        "conv_label":          conv_label,
     }
 
+
+# ── Plotting helpers ───────────────────────────────────────────────────────────
 
 def smooth(arr, window=7):
     arr = np.array(arr, dtype=float)
@@ -211,26 +256,34 @@ def plot_top2_progress(results, algo, args):
     fig.suptitle(f"{algo} — Top {len(runs)} Run(s) by Final Capital", fontsize=14, fontweight="bold")
 
     for ax, run in zip(axes[0], runs):
-        steps   = np.array(run["eval_steps"])
-        caps    = smooth(run["eval_capitals"])
-        risky   = smooth(run["eval_risky_frac"])
+        steps = np.array(run["eval_steps"])
+        caps  = smooth(run["eval_capitals"])
+        risky = smooth(run["eval_risky_frac"])
 
         ax2 = ax.twinx()
         l2, = ax2.plot(steps, risky * 100, color="gray", alpha=0.5, lw=1.5,
                        linestyle=":", label="% Risky Steps")
         l1, = ax.plot(steps, caps, color=color, lw=2.2, label="Final Capital ($)")
 
-        # Reference lines
-        ax.axhline(RISKY_CAPITAL, color="green", lw=1, linestyle="--", alpha=0.5, label=f"Always Risky ${RISKY_CAPITAL:.0f}")
-        ax.axhline(SAFE_CAPITAL,  color="orange", lw=1, linestyle="--", alpha=0.5, label=f"Always Safe ${SAFE_CAPITAL:.0f}")
+        ax.axhline(RISKY_CAPITAL, color="green",  lw=1, linestyle="--", alpha=0.5,
+                   label=f"Always Risky ${RISKY_CAPITAL:.0f}")
+        ax.axhline(SAFE_CAPITAL,  color="orange", lw=1, linestyle="--", alpha=0.5,
+                   label=f"Always Safe ${SAFE_CAPITAL:.0f}")
 
         ax2.set_ylim(0, 110)
         ax2.set_ylabel("% Risky Steps")
-        ax.set_ylim(0, args.capital_ylim)
+        # Auto-scale capital axis to actual data range
+        valid_caps = [c for c in run["eval_capitals"] if c is not None]
+        if valid_caps:
+            cap_max = max(max(valid_caps) * 1.15, SAFE_CAPITAL * 1.1)
+            ax.set_ylim(0, cap_max)
         ax.set_xlabel("Environment Steps")
         ax.set_ylabel("Final Capital ($)")
-        ax.set_title(f"Seed {run['seed']}  |  Final Capital: ${run['final_capital']:.0f}  |  Risky: {run['final_risky']*100:.0f}%",
-                     fontsize=11)
+        ax.set_title(
+            f"Seed {run['seed']}  |  Final Capital: ${run['final_capital']:.0f}  "
+            f"|  Risky: {run['final_risky']*100:.0f}%  |  Policy: {run['conv_label']}",
+            fontsize=11
+        )
         ax.grid(True, alpha=0.3)
         all_lines = [l1, l2]
         ax.legend(all_lines + ax.get_lines()[1:],
@@ -245,118 +298,173 @@ def plot_top2_progress(results, algo, args):
 
 
 def plot_comparison(all_results, args):
-    fig = plt.figure(figsize=(16, 12))
-    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.5, wspace=0.35)
-    ax_cap   = fig.add_subplot(gs[0, :])   # capital curves
+    """
+    4-panel comparison figure:
+      Row 0: Box plot of converged capital distribution (last 20% of training)
+      Row 1: % Risky steps over training (mean ± std across seeds)
+      Row 2L: Seed-level convergence classification (safe / mixed / risky)
+      Row 2R: Pooled capital histogram (last 20%) with percentile markers
+    """
+    fig = plt.figure(figsize=(16, 13))
+    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.55, wspace=0.35)
+    ax_box   = fig.add_subplot(gs[0, :])   # box plot — replaces empty capital curve
     ax_risky = fig.add_subplot(gs[1, :])   # risky fraction curves
-    ax_sc_c  = fig.add_subplot(gs[2, 0])   # scatter final capital
-    ax_sc_r  = fig.add_subplot(gs[2, 1])   # scatter risky fraction
+    ax_conv  = fig.add_subplot(gs[2, 0])   # seed convergence classification
+    ax_hist  = fig.add_subplot(gs[2, 1])   # pooled capital histogram
 
+    # ── Row 0: Box plot of converged-policy capital distribution ──────────────
+    box_data   = []
+    box_labels = []
+    box_colors = []
     for label in ["DQN", "IQN"]:
-        runs  = [r for r in all_results if r["label"] == label]
-        color = PALETTE[label]
-        ref_len = min(len(r["eval_capitals"]) for r in runs)
+        runs = [r for r in all_results if r["label"] == label]
+        for r in runs:
+            caps = r.get("converged_capitals", [])
+            if caps:
+                box_data.append(caps)
+                box_labels.append(f"{label}\ns{r['seed']}\n({r['conv_label']})")
+                box_colors.append(PALETTE[label])
+
+    if box_data:
+        bp = ax_box.boxplot(
+            box_data,
+            patch_artist=True,
+            medianprops=dict(color="white", lw=2),
+            whiskerprops=dict(lw=1.2),
+            capprops=dict(lw=1.2),
+            flierprops=dict(marker=".", markersize=3, alpha=0.4),
+        )
+        for patch, color in zip(bp["boxes"], box_colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.75)
+        ax_box.set_xticklabels(box_labels, fontsize=8)
+        ax_box.axhline(SAFE_CAPITAL,  color="orange", lw=1.5, linestyle="--", alpha=0.7,
+                       label=f"Always Safe ${SAFE_CAPITAL:.0f}")
+        ax_box.axhline(RISKY_CAPITAL, color="green",  lw=1.5, linestyle="--", alpha=0.7,
+                       label=f"Always Risky ${RISKY_CAPITAL:.0f}")
+        # Auto y-scale: 5th–95th percentile of all data, with headroom
+        all_caps = [c for d in box_data for c in d]
+        ymax = np.percentile(all_caps, 97) * 1.2
+        ax_box.set_ylim(0, max(ymax, SAFE_CAPITAL * 1.1))
+        ax_box.legend(fontsize=9)
+
+    ax_box.set_title(
+        "Converged Policy Capital Distribution — last 20% of training (per seed)\n"
+        "Training curve tracks median capital; box shows full episode distribution",
+        fontsize=13, fontweight="bold"
+    )
+    ax_box.set_ylabel("Final Capital ($) — median tracked in training log")
+    ax_box.grid(True, alpha=0.3, axis="y")
+
+    # ── Row 1: Risky fraction over training ───────────────────────────────────
+    for label in ["DQN", "IQN"]:
+        runs    = [r for r in all_results if r["label"] == label]
+        color   = PALETTE[label]
+        ref_len = min(len(r["eval_risky_frac"]) for r in runs)
         if ref_len == 0:
             continue
         ref_steps = np.array(runs[0]["eval_steps"][:ref_len])
-
-        # Capital curves
-        mat_cap = np.array([r["eval_capitals"][:ref_len] for r in runs])
-        m, s    = smooth(mat_cap.mean(0)), mat_cap.std(0)
-        ax_cap.plot(ref_steps, m, color=color, lw=2.5, label=label)
-        ax_cap.fill_between(ref_steps, m - s, m + s, color=color, alpha=0.15)
-
-        # Risky fraction curves
-        mat_r = np.array([r["eval_risky_frac"][:ref_len] for r in runs])
-        mr, sr = smooth(mat_r.mean(0) * 100), mat_r.std(0) * 100
+        mat_r     = np.array([r["eval_risky_frac"][:ref_len] for r in runs])
+        mr        = smooth(mat_r.mean(0) * 100)
+        sr        = mat_r.std(0) * 100
         ax_risky.plot(ref_steps, mr, color=color, lw=2.5, label=label)
         ax_risky.fill_between(ref_steps, mr - sr, mr + sr, color=color, alpha=0.15)
 
-        # Scatter
-        seeds = [r["seed"] for r in runs]
-        caps  = [r["final_capital"] for r in runs if r["final_capital"] is not None]
-        riskys= [r["final_risky"]*100 for r in runs if r["final_risky"] is not None]
-        x_off = 0.0 if label == "DQN" else 0.15
-        ax_sc_c.scatter([s + x_off for s in seeds], caps, color=color, s=80, zorder=3, label=label)
-        if caps:
-            ax_sc_c.hlines(np.mean(caps), -0.5, max(seeds)+0.7,
-                           colors=color, linestyles="--", lw=1.5, alpha=0.6)
-        ax_sc_r.scatter([s + x_off for s in seeds], riskys, color=color, s=80, zorder=3, label=label)
-        if riskys:
-            ax_sc_r.hlines(np.mean(riskys), -0.5, max(seeds)+0.7,
-                           colors=color, linestyles="--", lw=1.5, alpha=0.6)
-
-    # Reference lines on capital plot
-    ax_cap.axhline(RISKY_CAPITAL, color="green", lw=1.5, linestyle="--", alpha=0.7,
-                   label=f"Always Risky ${RISKY_CAPITAL:.0f} (optimal)")
-    ax_cap.axhline(SAFE_CAPITAL,  color="orange", lw=1.5, linestyle="--", alpha=0.7,
-                   label=f"Always Safe ${SAFE_CAPITAL:.0f} (suboptimal)")
-    ax_risky.axhline(100, color="green", lw=1, linestyle="--", alpha=0.5, label="Always Risky")
+    ax_risky.axhline(100, color="green",  lw=1, linestyle="--", alpha=0.5, label="Always Risky")
     ax_risky.axhline(0,   color="orange", lw=1, linestyle="--", alpha=0.5, label="Always Safe")
+    ax_risky.set_title("% Risky Steps — Greedy Policy (mean ± std across seeds)",
+                        fontsize=13, fontweight="bold")
+    ax_risky.set_xlabel("Environment Steps")
+    ax_risky.set_ylabel("% Risky Steps")
+    ax_risky.set_ylim(-5, 115)
+    ax_risky.legend(fontsize=10)
+    ax_risky.grid(True, alpha=0.3)
 
-    ax_cap.set_title("Final Capital over Training (mean ± std)", fontsize=13, fontweight="bold")
-    ax_cap.set_xlabel("Environment Steps"); ax_cap.set_ylabel("Final Capital ($)")
-    ax_cap.set_ylim(0, args.capital_ylim); ax_cap.legend(fontsize=10); ax_cap.grid(True, alpha=0.3)
+    # ── Row 2L: Seed convergence classification ────────────────────────────────
+    conv_map  = {"safe": 0, "mixed": 1, "risky": 2}
+    conv_color = {"safe": "#4A9EE0", "mixed": "#AAAAAA", "risky": "#E05C5C"}
+    for label in ["DQN", "IQN"]:
+        runs   = [r for r in all_results if r["label"] == label]
+        x_off  = -0.15 if label == "DQN" else 0.15
+        for r in runs:
+            cl = r.get("conv_label", "mixed")
+            ax_conv.scatter(
+                r["seed"] + x_off, conv_map[cl],
+                color=PALETTE[label], s=120, zorder=3,
+                marker="o" if label == "IQN" else "s",
+                edgecolors=conv_color[cl], linewidths=2,
+                label=f"{label}" if r["seed"] == runs[0]["seed"] else "",
+            )
+            # Annotate conv_risky %
+            ax_conv.annotate(
+                f"{r['conv_risky']*100:.0f}%",
+                (r["seed"] + x_off, conv_map[cl]),
+                textcoords="offset points", xytext=(0, 8),
+                ha="center", fontsize=7, color=PALETTE[label],
+            )
 
-    ax_risky.set_title("% Risky Steps Chosen by Greedy Policy (mean ± std)", fontsize=13, fontweight="bold")
-    ax_risky.set_xlabel("Environment Steps"); ax_risky.set_ylabel("% Risky Steps")
-    ax_risky.set_ylim(-5, 115); ax_risky.legend(fontsize=10); ax_risky.grid(True, alpha=0.3)
+    ax_conv.set_yticks([0, 1, 2])
+    ax_conv.set_yticklabels(["Safe\n(<30% risky)", "Mixed\n(30–70%)", "Risky\n(>70%)"])
+    ax_conv.set_xticks(range(max(r["seed"] for r in all_results) + 1))
+    ax_conv.set_xlabel("Seed")
+    ax_conv.set_title("Converged Strategy per Seed", fontsize=11, fontweight="bold")
+    ax_conv.legend(fontsize=9, loc="upper right")
+    ax_conv.grid(True, alpha=0.3, axis="x")
 
-    ax_sc_c.set_title("Final Capital by Seed", fontsize=11, fontweight="bold")
-    ax_sc_c.set_ylim(0, args.capital_ylim); ax_sc_c.set_xlabel("Seed"); ax_sc_c.set_ylabel("Capital ($)")
-    ax_sc_c.axhline(RISKY_CAPITAL, color="green", lw=1, linestyle="--", alpha=0.5)
-    ax_sc_c.axhline(SAFE_CAPITAL,  color="orange", lw=1, linestyle="--", alpha=0.5)
-    ax_sc_c.legend(fontsize=10); ax_sc_c.grid(True, alpha=0.3, axis="y")
-
-    ax_sc_r.set_title("Final % Risky Steps by Seed", fontsize=11, fontweight="bold")
-    ax_sc_r.set_ylim(-5, 115); ax_sc_r.set_xlabel("Seed"); ax_sc_r.set_ylabel("% Risky")
-    ax_sc_r.legend(fontsize=10); ax_sc_r.grid(True, alpha=0.3, axis="y")
-
+    # ── Row 2R: Pooled converged capital histogram + stats ────────────────────
+    stats_lines = []
     for label in ["DQN", "IQN"]:
         runs  = [r for r in all_results if r["label"] == label]
-        caps  = [r["final_capital"] for r in runs if r["final_capital"]]
-        risky = [r["final_risky"]*100 for r in runs if r["final_risky"] is not None]
-        if caps:
-            print(f"{label}: mean_capital=${np.mean(caps):.0f}  risky={np.mean(risky):.1f}%  "
-                  f"(safe=${SAFE_CAPITAL:.0f} risky_opt=${RISKY_CAPITAL:.0f})")
+        caps  = [c for r in runs for c in r.get("converged_capitals", [])]
+        if not caps:
+            continue
+        color = PALETTE[label]
+        ax_hist.hist(caps, bins=30, color=color, alpha=0.45, label=label, density=True)
+        # Percentile markers
+        for pct, ls in [(10, ":"), (50, "--"), (90, "-.")]:
+            v = np.percentile(caps, pct)
+            ax_hist.axvline(v, color=color, lw=1.2, linestyle=ls, alpha=0.8)
+        med   = np.median(caps)
+        p10   = np.percentile(caps, 10)
+        p90   = np.percentile(caps, 90)
+        stats_lines.append(f"{label}: median=${med:.0f}  p10=${p10:.0f}  p90=${p90:.0f}")
+
+    # Mann-Whitney U test between pooled distributions
+    dqn_caps = [c for r in all_results if r["label"] == "DQN"
+                for c in r.get("converged_capitals", [])]
+    iqn_caps = [c for r in all_results if r["label"] == "IQN"
+                for c in r.get("converged_capitals", [])]
+    if dqn_caps and iqn_caps:
+        u_stat, p_val = stats.mannwhitneyu(iqn_caps, dqn_caps, alternative="greater")
+        stats_lines.append(f"Mann-Whitney U (IQN>DQN): p={p_val:.3f}")
+
+    ax_hist.axvline(SAFE_CAPITAL,  color="orange", lw=1.5, linestyle="--", alpha=0.7,
+                    label=f"Always Safe ${SAFE_CAPITAL:.0f}")
+    ax_hist.axvline(RISKY_CAPITAL, color="green",  lw=1.5, linestyle="--", alpha=0.7,
+                    label=f"Always Risky ${RISKY_CAPITAL:.0f}")
+    ax_hist.set_xlabel("Final Capital ($)")
+    ax_hist.set_ylabel("Density")
+    ax_hist.set_title("Pooled Converged Capital Distribution\n(last 20% of training, all seeds)",
+                      fontsize=11, fontweight="bold")
+    ax_hist.legend(fontsize=8)
+    ax_hist.grid(True, alpha=0.3)
+
+    # Print stats summary below histogram
+    fig.text(0.76, 0.02, "\n".join(stats_lines), ha="center", va="bottom",
+             fontsize=8, family="monospace",
+             bbox=dict(boxstyle="round", facecolor="whitesmoke", alpha=0.8))
 
     path = os.path.join(args.out_dir, "comparison.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
+
+    # Also print to console
+    for line in stats_lines:
+        print(line)
     return path
 
 
-def get_modal_strategy(all_results, label):
-    """Get most common risky ratio (5% bins) from last 10% of eval checkpoints."""
-    fracs = []
-    for r in all_results:
-        if r["label"] != label:
-            continue
-        rf = r["eval_risky_frac"]
-        n = len(rf)
-        fracs.extend(rf[max(0, n - n // 10):])
-    if not fracs:
-        return 0.5
-    bins = np.arange(0, 1.05, 0.05)
-    counts, edges = np.histogram(fracs, bins=bins)
-    best = counts.argmax()
-    return (edges[best] + edges[best + 1]) / 2.0
-
-
-def simulate_fixed_strategy(risky_ratio, episode_length, n_episodes=20):
-    """Run n_episodes with a fixed risky_ratio, return mean final capital."""
-    capitals = []
-    for _ in range(n_episodes):
-        capital = 100.0
-        for t in range(episode_length):
-            if np.random.random() < risky_ratio:
-                ret = 0.35 if np.random.random() < 0.50 else -0.15
-            else:
-                ret = 0.10
-            capital *= (1 + ret)
-        capitals.append(capital)
-    return float(np.mean(capitals))
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     args   = parse_args()
@@ -364,7 +472,7 @@ def main():
     log    = setup_logging(args.out_dir)
 
     epsilon_decay = int(args.epsilon_frac * args.total_steps / np.log(20))
-    log.info(f"Device: {device} | epsilon reaches 0.05 at step ~{int(args.epsilon_frac*args.total_steps):,} | args: {vars(args)}")
+    log.info(f"Device: {device} | epsilon_decay={epsilon_decay} | args: {vars(args)}")
     log.info(f"Theoretical optima: safe=${SAFE_CAPITAL:.0f}  always-risky=${RISKY_CAPITAL:.0f}")
 
     shared = dict(
@@ -385,23 +493,14 @@ def main():
 
     all_results = []
     for seed in range(args.n_seeds):
-        all_results.append(train_run(DQNAgent, shared, seed, "DQN", args, device, log))
+        all_results.append(train_run(IQNAgent, iqn_kwargs,  seed, "IQN", args, device, log))
     for seed in range(args.n_seeds):
-        all_results.append(train_run(IQNAgent, iqn_kwargs, seed, "IQN", args, device, log))
-
+        all_results.append(train_run(DQNAgent, shared,      seed, "DQN", args, device, log))
 
 
     plot_top2_progress(all_results, "DQN", args)
     plot_top2_progress(all_results, "IQN", args)
     plot_comparison(all_results, args)
-
-    # Extract modal strategies and simulate
-    log.info("=== Fixed-Strategy Comparison ===")
-    for label in ["DQN", "IQN"]:
-        ratio = get_modal_strategy(all_results, label)
-        avg_cap = simulate_fixed_strategy(ratio, args.episode_length, n_episodes=20)
-        log.info(f"{label}: modal risky ratio={ratio:.0%} (bin center) | "
-                 f"20-episode avg capital=${avg_cap:,.0f}")
 
     log.info("Done. Results in " + args.out_dir)
 

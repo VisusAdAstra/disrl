@@ -75,7 +75,7 @@ class BimodalInvestmentEnv:
         # Terminal bonus: log(final_capital / 100) — rewards compounding
         # Safe path gets ~9.53, risky path gets ~6.77 on average
         if dones.any():
-            rewards[dones] += np.log(self.capital[dones] / 100.0)/100
+            #rewards[dones] += np.log(self.capital[dones] / 100.0)/100
             self.capital[dones] = 100.0
             self.steps[dones]   = 0
 
