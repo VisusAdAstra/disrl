@@ -3,38 +3,20 @@ import torch
 import argparse
 import logging
 import time
+import json
 
 from dqn import DQNAgent
 from cvar_rl import CVaRAgent
 
-
 # ─────────────────────────────────────────────────────────────
-# CliffWalking Environment (with stochastic cliff risk)
+# CliffWalking Environment
 # ─────────────────────────────────────────────────────────────
 
 class CliffWalkingEnv:
-    """
-    Grid: 4 x 12 (classic)
-    Start: (3, 0)
-    Goal:  (3, 11)
-    Cliff: (3, 1..10)
-
-    Reward:
-      -1 per step
-      -100 if fall into cliff
-
-    Added stochasticity:
-      If agent is adjacent to cliff, with prob p_slip → falls
-    """
-
     def __init__(self, slip_prob=0.05):
-        self.h = 4
-        self.w = 12
-        self.start = (3, 0)
-        self.goal  = (3, 11)
-
+        self.h, self.w = 4, 12
+        self.start, self.goal = (3, 0), (3, 11)
         self.slip_prob = slip_prob
-
         self.reset()
 
     def reset(self):
@@ -42,169 +24,122 @@ class CliffWalkingEnv:
         return self._state()
 
     def _state(self):
-        # normalize coordinates
         return np.array([self.pos[0] / self.h, self.pos[1] / self.w], dtype=np.float32)
 
     def step(self, action):
         r, c = self.pos
-
-        # actions: 0=up,1=down,2=left,3=right
         if action == 0: r = max(0, r - 1)
         elif action == 1: r = min(self.h - 1, r + 1)
         elif action == 2: c = max(0, c - 1)
         elif action == 3: c = min(self.w - 1, c + 1)
 
-        next_pos = (r, c)
+        if (r == 2 and 1 <= c <= 10) and np.random.rand() < self.slip_prob:
+            r, c = 3, np.random.randint(1, 11)
 
-        # ── stochastic slip near cliff ──
-        if self._near_cliff(self.pos) and np.random.rand() < self.slip_prob:
-            next_pos = (3, np.random.randint(1, 11))  # fall somewhere in cliff
+        self.pos = (r, c)
 
-        self.pos = next_pos
-
-        # ── reward logic ──
         if self.pos[0] == 3 and 1 <= self.pos[1] <= 10:
-            # cliff
-            reward = -100.0
-            done = True
-            self.reset()
+            return self.reset(), -100.0, True
         elif self.pos == self.goal:
-            reward = 0.0
-            done = True
-            self.reset()
-        else:
-            reward = -1.0
-            done = False
+            return self.reset(), 0.0, True
+        return self._state(), -1.0, False
 
-        return self._state(), reward, done
+# ─── New Vectorized Wrapper ───
+class VectorCliffEnv:
+    def __init__(self, num_envs, slip_prob=0.05):
+        self.envs = [CliffWalkingEnv(slip_prob) for _ in range(num_envs)]
+        self.num_envs = num_envs
 
-    def _near_cliff(self, pos):
-        r, c = pos
-        return (r == 2 and 1 <= c <= 10)
+    def reset(self):
+        return np.array([e.reset() for e in self.envs])
 
+    def step(self, actions):
+        results = [e.step(a) for e, a in zip(self.envs, actions)]
+        states, rewards, dones = zip(*results)
+        return np.array(states), np.array(rewards), np.array(dones)
 
 # ─────────────────────────────────────────────────────────────
-# Evaluation
+# Evaluation (Remains Single Env for Accuracy)
 # ─────────────────────────────────────────────────────────────
 
-def evaluate(agent, env, episodes=50, device="cpu"):
-    returns = []
-    cliff_falls = 0
-
+def evaluate(agent, env, episodes=20, device="cpu"):
+    returns, falls = [], 0
     for _ in range(episodes):
         s = env.reset()
-        total = 0
-
+        total_r = 0
         for _ in range(200):
             st = torch.FloatTensor(s).unsqueeze(0).to(device)
-
+            # Use deterministic selection if possible, else standard greedy
             with torch.no_grad():
                 if hasattr(agent, "cvar_alpha"):
-                    q = agent.online(st)
-                    a = agent._cvar_values(q).argmax(1).item()
+                    a = agent._cvar_values(agent.online(st)).argmax(1).item()
                 else:
                     a = agent.online(st).argmax(1).item()
-
             s, r, d = env.step(a)
-            total += r
-
-            if r == -100:
-                cliff_falls += 1
-
-            if d:
-                break
-
-        returns.append(total)
-
-    return np.mean(returns), cliff_falls / episodes
-
+            total_r += r
+            if r == -100: falls += 1
+            if d: break
+        returns.append(total_r)
+    return np.mean(returns), falls / episodes
 
 # ─────────────────────────────────────────────────────────────
-# Training loop
+# Training loop (Updated for Vector Steps)
 # ─────────────────────────────────────────────────────────────
 
-def train(agent, env, args, name):
+def train(agent, venv, eval_env, args, name):
     device = args.device
-    s = env.reset()
-
+    states = venv.reset()
     start = time.time()
 
-    for step in range(1, args.total_steps + 1):
-        agent.total_steps = step
+    # Step by num_envs to match total_steps logic
+    for step in range(0, args.total_steps, args.num_envs):
+        agent.total_steps = step # Updates epsilon internally
+        
+        st = torch.FloatTensor(states).to(device)
+        actions = agent.select_actions(st)
+        
+        next_states, rewards, dones = venv.step(actions)
 
-        st = torch.FloatTensor(s).unsqueeze(0).to(device)
-        a = agent.select_actions(st)[0]
-
-        ns, r, d = env.step(a)
-
-        agent.store(
-            np.array([s]),
-            np.array([a]),
-            np.array([r], dtype=np.float32),
-            np.array([ns]),
-            np.array([d], dtype=np.float32),
-        )
-
-        loss = agent.update()
-
-        s = ns if not d else env.reset()
+        # ReplayBuffer.add_batch handles the arrays directly
+        agent.store(states, actions, rewards, next_states, dones)
+        
+        agent.update()
+        states = next_states
 
         if step % args.eval_interval == 0:
-            ret, fall_rate = evaluate(agent, env, device=device)
-
+            ret, fall_rate = evaluate(agent, eval_env, device=device)
             logging.info(
-                f"[{name}] step={step:6d} | return={ret:7.2f} | "
-                f"cliff_fall={fall_rate:.2f} | eps={agent.epsilon:.3f} | "
-                f"elapsed={int(time.time()-start)}s"
+                f"[{name}] step={step:6d} | ret={ret:7.2f} | cliff={fall_rate:.2f} | "
+                f"eps={agent.epsilon:.3f} | {int(time.time()-start)}s"
             )
-
-
-# ─────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--total_steps", type=int, default=150_000)
+    parser.add_argument("--total_steps", type=int, default=200_000)
+    parser.add_argument("--num_envs", type=int, default=8)
     parser.add_argument("--eval_interval", type=int, default=5000)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--cvar_alpha", type=float, default=0.25)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    env = CliffWalkingEnv(slip_prob=0.05)
-
-    state_dim = 2
-    n_actions = 4
+    # Env setup
+    venv = VectorCliffEnv(args.num_envs, slip_prob=0.05)
+    eval_env = CliffWalkingEnv(slip_prob=0.05)
 
     common = dict(
-        state_dim=state_dim,
-        n_actions=n_actions,
-        lr=args.lr,
-        gamma=args.gamma,
-        batch_size=256,
-        buffer_size=100_000,
-        target_update_freq=500,
-        hidden=128,
-        device=args.device,
-        epsilon_start=1.0,
-        epsilon_end=0.05,
-        epsilon_decay=30000,
+        state_dim=2, n_actions=4, lr=3e-4, gamma=0.99,
+        batch_size=256, buffer_size=100_000, target_update_freq=1000,
+        hidden=128, device=args.device,
+        epsilon_start=1.0, epsilon_end=0.05, 
+        epsilon_decay=args.total_steps // 5 # Scale decay to total steps
     )
 
-    # ── DQN ─────────────────────────
-    dqn = DQNAgent(**common)
-    logging.info("=== Training DQN ===")
-    train(dqn, env, args, "DQN")
+    # logging.info(f"=== Training DQN ({args.num_envs} envs) ===")
+    # train(DQNAgent(**common), venv, eval_env, args, "DQN")
 
-    # ── CVaR ───────────────────────
-    cvar = CVaRAgent(**common, n_quantiles=64, cvar_alpha=args.cvar_alpha)
-    logging.info(f"=== Training CVaR (alpha={args.cvar_alpha}) ===")
-    train(cvar, env, args, "CVaR")
-
+    logging.info(f"=== Training CVaR ({args.num_envs} envs) ===")
+    train(CVaRAgent(**common, n_quantiles=64, cvar_alpha=0.75), venv, eval_env, args, "CVaR")
 
 if __name__ == "__main__":
     main()
