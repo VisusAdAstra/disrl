@@ -2,7 +2,7 @@
 Training: DQN vs IQN vs CVaR-RL on Bimodal Investment Environment.
 
 Usage: python train.py [options]
-python train.py --n_seeds 1 --cvar_alpha 0.1
+python train.py --n_seeds 1 --cvar_alpha 0.1 --lr 1e-4 --n_envs 16
 
   --n_seeds          INT    Seeds per algorithm              (default: 2)
   --total_steps      INT    Env steps per run               (default: 300000)
@@ -455,6 +455,7 @@ def plot_comparison(all_results, args):
             )
             stats_lines.append(f"MW-U {la} vs {lb}: p={p_val:.3f}")
 
+    ax_hist.set_xlim(0, 5000)
     ax_hist.axvline(SAFE_CAPITAL,  color="orange", lw=1.5, linestyle="--",
                     alpha=0.7, label=f"Always Safe ${SAFE_CAPITAL:.0f}")
     ax_hist.axvline(RISKY_CAPITAL, color="green",  lw=1.5, linestyle="--",
@@ -569,12 +570,12 @@ def main():
         )
     algos.append("DQN")
 
-    # log.info("=== Training IQN ===")
-    # for seed in range(args.n_seeds):
-    #     all_results.append(
-    #         train_run(IQNAgent, iqn_kwargs, seed, "IQN", args, device, log)
-    #     )
-    # algos.append("IQN")
+    log.info("=== Training IQN ===")
+    for seed in range(args.n_seeds):
+        all_results.append(
+            train_run(IQNAgent, iqn_kwargs, seed, "IQN", args, device, log)
+        )
+    algos.append("IQN")
 
     log.info("=== Plotting ===")
     for algo in algos:
