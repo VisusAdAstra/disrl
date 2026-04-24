@@ -63,10 +63,13 @@ class CliffWalkingVec:
         cliff = (self.pos[:, 0] == 3) & (self.pos[:, 1] >= 1) & (self.pos[:, 1] <= 10)
         goal  = (self.pos[:, 0] == 3) & (self.pos[:, 1] == 11)
 
+        # cliff (catastrophic)
         rewards[cliff] = -100.0
         dones[cliff]   = 1.0
 
-        dones[goal] = 1.0
+        # goal (positive signal)
+        rewards[goal]  = 10.0
+        dones[goal]    = 1.0
 
         # reset done envs
         reset_mask = dones == 1.0
