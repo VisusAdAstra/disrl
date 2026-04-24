@@ -3,213 +3,190 @@ import torch
 import argparse
 import logging
 import time
-import os
-import matplotlib.pyplot as plt
 
 from dqn import DQNAgent
 from cvar_rl import CVaRAgent
 
 
 # ─────────────────────────────────────────────────────────────
-# Vectorized CliffWalking
+# CliffWalking Environment (with stochastic cliff risk)
 # ─────────────────────────────────────────────────────────────
 
-class CliffWalkingVec:
-    def __init__(self, n_envs=8, slip_prob=0.05):
-        self.n_envs = n_envs
-        self.h, self.w = 4, 12
+class CliffWalkingEnv:
+    """
+    Grid: 4 x 12 (classic)
+    Start: (3, 0)
+    Goal:  (3, 11)
+    Cliff: (3, 1..10)
+
+    Reward:
+      -1 per step
+      -100 if fall into cliff
+
+    Added stochasticity:
+      If agent is adjacent to cliff, with prob p_slip → falls
+    """
+
+    def __init__(self, slip_prob=0.05):
+        self.h = 4
+        self.w = 12
+        self.start = (3, 0)
+        self.goal  = (3, 11)
+
         self.slip_prob = slip_prob
 
-        self.start = np.array([3, 0])
-        self.goal  = np.array([3, 11])
-
-        self.pos = np.tile(self.start, (n_envs, 1))
+        self.reset()
 
     def reset(self):
-        self.pos[:] = self.start
+        self.pos = self.start
         return self._state()
 
     def _state(self):
-        return np.stack([
-            self.pos[:, 0] / self.h,
-            self.pos[:, 1] / self.w
-        ], axis=1).astype(np.float32)
+        # normalize coordinates
+        return np.array([self.pos[0] / self.h, self.pos[1] / self.w], dtype=np.float32)
 
-    def step(self, actions):
-        r, c = self.pos[:, 0], self.pos[:, 1]
+    def step(self, action):
+        r, c = self.pos
 
-        # actions
-        r = np.where(actions == 0, np.maximum(0, r - 1), r)
-        r = np.where(actions == 1, np.minimum(self.h - 1, r + 1), r)
-        c = np.where(actions == 2, np.maximum(0, c - 1), c)
-        c = np.where(actions == 3, np.minimum(self.w - 1, c + 1), c)
+        # actions: 0=up,1=down,2=left,3=right
+        if action == 0: r = max(0, r - 1)
+        elif action == 1: r = min(self.h - 1, r + 1)
+        elif action == 2: c = max(0, c - 1)
+        elif action == 3: c = min(self.w - 1, c + 1)
 
-        next_pos = np.stack([r, c], axis=1)
+        next_pos = (r, c)
 
-        # slip
-        near = (self.pos[:, 0] == 2) & (self.pos[:, 1] >= 1) & (self.pos[:, 1] <= 10)
-        slip = (np.random.rand(self.n_envs) < self.slip_prob) & near
-
-        next_pos[slip] = np.stack([
-            np.full(slip.sum(), 3),
-            np.random.randint(1, 11, size=slip.sum())
-        ], axis=1)
+        # ── stochastic slip near cliff ──
+        if self._near_cliff(self.pos) and np.random.rand() < self.slip_prob:
+            next_pos = (3, np.random.randint(1, 11))  # fall somewhere in cliff
 
         self.pos = next_pos
 
-        rewards = -np.ones(self.n_envs, dtype=np.float32)
-        dones   = np.zeros(self.n_envs, dtype=np.float32)
+        # ── reward logic ──
+        if self.pos[0] == 3 and 1 <= self.pos[1] <= 10:
+            # cliff
+            reward = -100.0
+            done = True
+            self.reset()
+        elif self.pos == self.goal:
+            reward = 0.0
+            done = True
+            self.reset()
+        else:
+            reward = -1.0
+            done = False
 
-        cliff = (self.pos[:, 0] == 3) & (self.pos[:, 1] >= 1) & (self.pos[:, 1] <= 10)
-        goal  = (self.pos[:, 0] == 3) & (self.pos[:, 1] == 11)
+        return self._state(), reward, done
 
-        # cliff (catastrophic)
-        rewards[cliff] = -100.0
-        dones[cliff]   = 1.0
-
-        # goal (positive signal)
-        rewards[goal]  = 10.0
-        dones[goal]    = 1.0
-
-        # reset done envs
-        reset_mask = dones == 1.0
-        self.pos[reset_mask] = self.start
-
-        return self._state(), rewards, dones, cliff
+    def _near_cliff(self, pos):
+        r, c = pos
+        return (r == 2 and 1 <= c <= 10)
 
 
 # ─────────────────────────────────────────────────────────────
 # Evaluation
 # ─────────────────────────────────────────────────────────────
 
-def evaluate(agent, env, device):
-    states = env.reset()
-    total_rewards = np.zeros(env.n_envs)
-    falls = np.zeros(env.n_envs)
+def evaluate(agent, env, episodes=50, device="cpu"):
+    returns = []
+    cliff_falls = 0
 
-    for _ in range(200):
-        st = torch.FloatTensor(states).to(device)
+    for _ in range(episodes):
+        s = env.reset()
+        total = 0
 
-        with torch.no_grad():
-            if hasattr(agent, "cvar_alpha"):
-                q = agent.online(st)
-                actions = agent._cvar_values(q).argmax(1).cpu().numpy()
-            else:
-                actions = agent.online(st).argmax(1).cpu().numpy()
+        for _ in range(200):
+            st = torch.FloatTensor(s).unsqueeze(0).to(device)
 
-        states, rewards, dones, cliff = env.step(actions)
+            with torch.no_grad():
+                if hasattr(agent, "cvar_alpha"):
+                    q = agent.online(st)
+                    a = agent._cvar_values(q).argmax(1).item()
+                else:
+                    a = agent.online(st).argmax(1).item()
 
-        total_rewards += rewards
-        falls += cliff.astype(np.float32)
+            s, r, d = env.step(a)
+            total += r
 
-    return np.mean(total_rewards), np.mean(falls)
+            if r == -100:
+                cliff_falls += 1
+
+            if d:
+                break
+
+        returns.append(total)
+
+    return np.mean(returns), cliff_falls / episodes
 
 
 # ─────────────────────────────────────────────────────────────
-# Training
+# Training loop
 # ─────────────────────────────────────────────────────────────
 
 def train(agent, env, args, name):
     device = args.device
-    states = env.reset()
-
-    log = {
-        "steps": [],
-        "returns": [],
-        "falls": [],
-        "loss": [],
-    }
+    s = env.reset()
 
     start = time.time()
 
     for step in range(1, args.total_steps + 1):
         agent.total_steps = step
 
-        st = torch.FloatTensor(states).to(device)
-        actions = agent.select_actions(st)
+        st = torch.FloatTensor(s).unsqueeze(0).to(device)
+        a = agent.select_actions(st)[0]
 
-        next_states, rewards, dones, _ = env.step(actions)
+        ns, r, d = env.step(a)
 
-        agent.store(states, actions, rewards, next_states, dones)
+        agent.store(
+            np.array([s]),
+            np.array([a]),
+            np.array([r], dtype=np.float32),
+            np.array([ns]),
+            np.array([d], dtype=np.float32),
+        )
+
         loss = agent.update()
 
-        states = next_states
+        s = ns if not d else env.reset()
 
         if step % args.eval_interval == 0:
-            ret, fall = evaluate(agent, env, device)
-
-            log["steps"].append(step)
-            log["returns"].append(ret)
-            log["falls"].append(fall)
-            log["loss"].append(loss if loss else 0)
+            ret, fall_rate = evaluate(agent, env, device=device)
 
             logging.info(
-                f"[{name}] step={step} | return={ret:.2f} | fall={fall:.2f} | "
-                f"eps={agent.epsilon:.3f} | loss={loss:.2f} | time={int(time.time()-start)}s"
+                f"[{name}] step={step:6d} | return={ret:7.2f} | "
+                f"cliff_fall={fall_rate:.2f} | eps={agent.epsilon:.3f} | "
+                f"elapsed={int(time.time()-start)}s"
             )
-
-    return log
-
-
-# ─────────────────────────────────────────────────────────────
-# Plotting
-# ─────────────────────────────────────────────────────────────
-
-def plot_results(dqn_log, cvar_log, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Return
-    plt.figure()
-    plt.plot(dqn_log["steps"], dqn_log["returns"], label="DQN")
-    plt.plot(cvar_log["steps"], cvar_log["returns"], label="CVaR")
-    plt.legend()
-    plt.title("Return")
-    plt.savefig(f"{out_dir}/return.png")
-
-    # Cliff falls
-    plt.figure()
-    plt.plot(dqn_log["steps"], dqn_log["falls"], label="DQN")
-    plt.plot(cvar_log["steps"], cvar_log["falls"], label="CVaR")
-    plt.legend()
-    plt.title("Cliff Fall Rate")
-    plt.savefig(f"{out_dir}/falls.png")
-
-    # Loss
-    plt.figure()
-    plt.plot(dqn_log["steps"], dqn_log["loss"], label="DQN")
-    plt.plot(cvar_log["steps"], cvar_log["loss"], label="CVaR")
-    plt.legend()
-    plt.title("Loss")
-    plt.savefig(f"{out_dir}/loss.png")
 
 
 # ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
-#! python train_cliff.py --n_envs 8
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--total_steps", type=int, default=300000)
+    parser.add_argument("--total_steps", type=int, default=150_000)
     parser.add_argument("--eval_interval", type=int, default=5000)
-    parser.add_argument("--n_envs", type=int, default=8)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--cvar_alpha", type=float, default=0.25)
-    parser.add_argument("--out_dir", type=str, default="./cliff_results")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    env = CliffWalkingVec(n_envs=args.n_envs)
+    env = CliffWalkingEnv(slip_prob=0.05)
+
+    state_dim = 2
+    n_actions = 4
 
     common = dict(
-        state_dim=2,
-        n_actions=4,
+        state_dim=state_dim,
+        n_actions=n_actions,
         lr=args.lr,
-        gamma=0.99,
+        gamma=args.gamma,
         batch_size=256,
-        buffer_size=100000,
+        buffer_size=100_000,
         target_update_freq=500,
         hidden=128,
         device=args.device,
@@ -218,21 +195,15 @@ def main():
         epsilon_decay=30000,
     )
 
+    # ── DQN ─────────────────────────
     dqn = DQNAgent(**common)
+    logging.info("=== Training DQN ===")
+    train(dqn, env, args, "DQN")
+
+    # ── CVaR ───────────────────────
     cvar = CVaRAgent(**common, n_quantiles=64, cvar_alpha=args.cvar_alpha)
-
-    logging.info("Training DQN...")
-    dqn_log = train(dqn, env, args, "DQN")
-
-    logging.info("Training CVaR...")
-    cvar_log = train(cvar, env, args, "CVaR")
-
-    # save
-    os.makedirs(args.out_dir, exist_ok=True)
-    np.savez(f"{args.out_dir}/dqn.npz", **dqn_log)
-    np.savez(f"{args.out_dir}/cvar.npz", **cvar_log)
-
-    plot_results(dqn_log, cvar_log, args.out_dir)
+    logging.info(f"=== Training CVaR (alpha={args.cvar_alpha}) ===")
+    train(cvar, env, args, "CVaR")
 
 
 if __name__ == "__main__":
