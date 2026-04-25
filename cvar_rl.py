@@ -73,6 +73,7 @@ class CVaRAgent:
 
         # Quantile fractions
         self.taus = torch.linspace(0.0, 1.0, n_quantiles + 1)[1:].to(device)
+        # self.taus = ((torch.arange(n_quantiles, device=device) + 0.5) / n_quantiles)
 
         # Networks
         self.online = QuantileNetwork(state_dim, n_actions, n_quantiles, hidden).to(device)
@@ -173,6 +174,7 @@ class CVaRAgent:
 
         tau = self.taus.view(1, self.n_quantiles, 1)
         loss = (torch.abs(tau - (td_error.detach() < 0).float()) * huber).mean()
+        # loss = (torch.abs(tau - (td_error.detach() < 0).float()) * huber).sum(dim=2).mean()
 
         self.optimizer.zero_grad()
         loss.backward()
