@@ -1,4 +1,4 @@
-# Distributional Reinforcement Learning: IQN vs DQN vs CVaR-RL
+# Distributional Reinforcement Learning
 
 A research codebase comparing distributional and standard value-based RL algorithms
 on two environments designed to analyze advantages of
@@ -203,7 +203,7 @@ Outputs saved to `./cliff_results/`:
 
 ## Key Results
 
-### Investment Environment
+### Bimodal Return Environment
 | Agent | Converged Policy | Median Capital | Fall Rate (cliff) |
 |---|---|---|---|
 | DQN | ~80% risky | \$663 | — |
