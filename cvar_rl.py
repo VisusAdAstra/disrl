@@ -152,19 +152,28 @@ class CVaRAgent:
 
         with torch.no_grad():
             # Double Q-style action selection (important for stability)
-            next_q_online = self.online(next_states)
-            next_cvar     = self._cvar_values(next_q_online)
-            next_actions  = next_cvar.argmax(dim=1)
+            # next_q_online = self.online(next_states)
+            # next_cvar     = self._cvar_values(next_q_online)
+            # next_actions  = next_cvar.argmax(dim=1)
+            # Bootstrap uses MEAN Q for next action selection (stable)
+            # CVaR is only used in select_actions (policy deployment)
+            # Using CVaR here causes negative spiral: near-cliff states have
+            # very negative lower quantiles -> CVaR bootstrap target becomes
+            # catastrophically negative -> all near-cliff Q values collapse
+            # -> agent cannot distinguish safe vs unsafe directions -> diverge
+            next_q_online = self.online(next_states)                          # [B, A, N]
+            next_actions  = next_q_online.mean(dim=2).argmax(dim=1)           # mean-greedy
 
             next_actions_expanded = next_actions.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, self.n_quantiles)
             next_q_target = self.target(next_states)
-            next_q = next_q_target.gather(1, next_actions_expanded).squeeze(1)
+            next_q = next_q_target.gather(1, next_actions_expanded).squeeze(1)  # [B, N]
 
             target = rewards.unsqueeze(1) + self.gamma * (1 - dones.unsqueeze(1)) * next_q
 
         # ── Quantile regression loss ─────────────────────────
-        td_error = (target.unsqueeze(1) - q.unsqueeze(2)).clamp(-10, 10)
-        # td_error = (target.unsqueeze(1) - q.unsqueeze(2)).clamp(-200, 200)
+        # td_error clamp must accommodate cliff reward magnitude (-100)
+        # Original clamp of -10,10 was too tight -> gradient vanishes near cliff
+        td_error = (target.unsqueeze(1) - q.unsqueeze(2)).clamp(-200, 200)
 
         huber = torch.where(
             td_error.abs() <= 1.0,

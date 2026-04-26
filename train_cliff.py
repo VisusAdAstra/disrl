@@ -223,7 +223,9 @@ def train(agent, venv, args, label, log):
     }
     loss_buf = deque(maxlen=200)
 
-    for step in range(0, args.total_steps, args.num_envs):
+    for step in range(0, args.total_steps+1, args.num_envs):
+        # if isinstance(agent, CVaRAgent):
+        #     agent.lr = args.lr/2
         agent.total_steps = step
 
         st      = torch.FloatTensor(states).to(args.device)
@@ -251,7 +253,8 @@ def train(agent, venv, args, label, log):
             history["ep_returns"].append(ep_rets)
 
             log.info(
-                f"[{label}] step={step:7d} | ret={mean_ret:7.2f} | "
+                f"[{label}] step={step:7d} | "
+                f"mean_ret={mean_ret:7.2f} | median_ret={float(np.median(ep_rets)):7.2f} | "
                 f"falls={fall_rate:.2f} | hits={cliff_hits:3d} | "
                 f"loss={avg_loss:.4f} | eps={agent.epsilon:.3f}"
             )
@@ -325,6 +328,18 @@ def plot_results(logs: dict, args):
     ax_fall.grid(True, alpha=0.3)
 
     # ── Converged return distribution (last 20%) ──────────────────────────────
+    # Use broken y-axis: top panel shows path quality (-10 to -55),
+    # bottom panel shows cliff falls (-88 to -112).
+    # This prevents -100 cliff penalty from compressing the path distribution,
+    # which caused DQN to appear as a single point in the original plot.
+    ax_box.remove()
+
+    gs2 = gridspec.GridSpecFromSubplotSpec(
+        2, 1, subplot_spec=gs[1, 0], height_ratios=[3, 1], hspace=0.08
+    )
+    ax_top = fig.add_subplot(gs2[0])
+    ax_bot = fig.add_subplot(gs2[1])
+
     box_data, box_labels, box_colors = [], [], []
     for label, h in logs.items():
         n_conv = max(1, len(h["ep_returns"]) // 5)
@@ -333,26 +348,49 @@ def plot_results(logs: dict, args):
         box_labels.append(label)
         box_colors.append(PALETTE[label])
 
-    bp = ax_box.boxplot(
-        box_data, patch_artist=True,
-        medianprops=dict(color="white", lw=2.5),
-        whiskerprops=dict(lw=1.3), capprops=dict(lw=1.3),
-        flierprops=dict(marker=".", markersize=3, alpha=0.4),
-    )
-    for patch, color in zip(bp["boxes"], box_colors):
-        patch.set_facecolor(color); patch.set_alpha(0.75)
-    ax_box.set_xticklabels(box_labels, fontsize=11)
-    ax_box.axhline(-13, color="gray",  lw=1.2, linestyle="--",
-                   alpha=0.7, label="Safe path optimal (−13)")
-    ax_box.axhline(-11, color="black", lw=1.2, linestyle=":",
-                   alpha=0.7, label="Risky path optimal (−11)")
-    ax_box.axhline(-100, color="red", lw=1.2, linestyle="-.",
-                   alpha=0.5, label="Cliff fall (−100)")
-    ax_box.set_ylabel("Episode Return")
-    ax_box.set_title("Converged Return Distribution\n(last 20% of training)",
+    for ax in [ax_top, ax_bot]:
+        bp = ax.boxplot(
+            box_data, patch_artist=True,
+            medianprops=dict(color="white", lw=2.5),
+            whiskerprops=dict(lw=1.3), capprops=dict(lw=1.3),
+            flierprops=dict(marker=".", markersize=4, alpha=0.5),
+        )
+        for patch, color in zip(bp["boxes"], box_colors):
+            patch.set_facecolor(color); patch.set_alpha(0.75)
+
+    # Top: path quality region
+    ax_top.set_ylim(-55, -8)
+    ax_top.axhline(-13, color="gray",  lw=1.2, linestyle="--",
+                   alpha=0.8, label="Safe path optimal (−13)")
+    ax_top.axhline(-11, color="black", lw=1.2, linestyle=":",
+                   alpha=0.8, label="Risky path optimal (−11)")
+    ax_top.set_xticklabels([])
+    ax_top.legend(fontsize=8, loc="lower right")
+    ax_top.grid(True, alpha=0.3, axis="y")
+    ax_top.set_ylabel("Episode Return")
+    ax_top.set_title("Converged Return Distribution\n(last 20% of training)",
                      fontweight="bold")
-    ax_box.legend(fontsize=8)
-    ax_box.grid(True, alpha=0.3, axis="y")
+    ax_top.spines["bottom"].set_visible(False)
+    ax_top.tick_params(bottom=False)
+
+    # Bottom: cliff fall region
+    ax_bot.set_ylim(-112, -88)
+    ax_bot.axhline(-100, color="red", lw=1.2, linestyle="-.",
+                   alpha=0.6, label="Cliff fall (−100)")
+    ax_bot.set_xticklabels(box_labels, fontsize=11)
+    ax_bot.legend(fontsize=8, loc="upper right")
+    ax_bot.grid(True, alpha=0.3, axis="y")
+    ax_bot.set_ylabel("Return")
+    ax_bot.spines["top"].set_visible(False)
+
+    # Broken axis diagonal marks
+    d = 0.015
+    kw = dict(transform=ax_top.transAxes, color="k", clip_on=False, lw=1.2)
+    ax_top.plot((-d, +d), (-d, +d), **kw)
+    ax_top.plot((1 - d, 1 + d), (-d, +d), **kw)
+    kw2 = dict(transform=ax_bot.transAxes, color="k", clip_on=False, lw=1.2)
+    ax_bot.plot((-d, +d), (1 - d, 1 + d), **kw2)
+    ax_bot.plot((1 - d, 1 + d), (1 - d, 1 + d), **kw2)
 
     # ── Cliff hits histogram ──────────────────────────────────────────────────
     for label, h in logs.items():
@@ -378,10 +416,12 @@ def plot_results(logs: dict, args):
         n_conv    = max(1, len(h["ep_returns"]) // 5)
         flat      = [r for ep in h["ep_returns"][-n_conv:] for r in ep]
         tot_falls = sum(h["cliff_hits"][-n_conv:])
+        n_eps_conv  = n_conv * args.eval_episodes
+        fall_rate_c = tot_falls / n_eps_conv if n_eps_conv > 0 else 0.0
         stats_lines.append(
-            f"{label}: median={np.median(flat):.1f}  "
+            f"{label}: mean={np.mean(flat):.1f}  median={np.median(flat):.1f}  "
             f"p10={np.percentile(flat,10):.1f}  "
-            f"cliff_hits={tot_falls}"
+            f"fall_rate={fall_rate_c:.3f}  cliff_hits={tot_falls}/{n_eps_conv}"
         )
     fig.text(
         0.5, 0.01, "   |   ".join(stats_lines),
@@ -401,7 +441,7 @@ def plot_results(logs: dict, args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--total_steps",   type=int,   default=800_000)
+    parser.add_argument("--total_steps",   type=int,   default=1_000_000)
     parser.add_argument("--num_envs",      type=int,   default=16)
     parser.add_argument("--eval_interval", type=int,   default=5_000)
     parser.add_argument("--eval_episodes", type=int,   default=50)
@@ -422,7 +462,7 @@ def main():
         ],
     )
     log.info(f"Device: {args.device} | slip_prob={args.slip_prob} | "
-             f"cvar_alpha={args.cvar_alpha} | num_envs={args.num_envs}")
+             f"cvar_alpha={args.cvar_alpha} | num_envs={args.num_envs} | total_steps={args.total_steps}")
 
     common = dict(
         state_dim=3,           # [row/H, col/W, step/max_steps]
